@@ -16,8 +16,6 @@ use std::time::{Duration, Instant};
 const KERNEL_SRC: &str = include_str!("kernels/mining.cu");
 const THREADS_PER_BLOCK: u32 = 256;
 const MAX_BLOCKS: u32 = 4096;
-/// Lowest candidate index (`u32::MAX` = none), then the count of nonces that
-/// candidate threads left unevaluated. Both are only ever updated atomically.
 /// Candidate count, then up to `MAX_HITS` candidate indices in claim order.
 const MAX_HITS: usize = 8;
 const RESULTS_U32S: usize = 1 + MAX_HITS;
@@ -57,9 +55,9 @@ struct WorkerBuffers {
 ///
 /// Search contract: every launch evaluates its whole nonce rectangle; no
 /// thread stops early. Up to `MAX_HITS` candidates per launch are recorded
-/// (any more are counted and skipped with a warning, which only happens at
-/// difficulties far below real mining), and the host recomputes each one with
-/// the exact CPU hash, returning the lowest that is really below the target.
+/// in atomic claim order. If that buffer overflows, the same start is replayed
+/// with a smaller batch until all candidates fit. The host recomputes each one
+/// with the exact CPU hash, returning the lowest that is really below the target.
 /// The kernel's Goldilocks reduction skips two carry corrections (`reduce128`
 /// in `kernels/mining.cu`): each of the roughly 1,470 field multiplies per
 /// hash can be off by EPS mod p with probability about 2^-33, so about one
@@ -67,9 +65,10 @@ struct WorkerBuffers {
 /// below the target is rejected by the CPU check; a wrong hash for a nonce that
 /// is actually valid is missed and the range reports `Exhausted`. The expected
 /// loss is about 3e-7 of solutions, far below the throughput the shortcut buys.
-/// `hash_count` is the number of nonces the launch evaluated, wrong ones
-/// included. `hash_nonces` is subject to the same contract: it is a kernel
-/// self-test, not a verifier; use `pow_core::hash_from_nonce`.
+/// `hash_count` is the number of nonces the launches evaluated, including
+/// overflow replays and wrong hashes. `hash_nonces` is subject to the same
+/// contract: it is a kernel self-test, not a verifier; use
+/// `pow_core::hash_from_nonce`.
 pub struct CudaEngine {
     engine_id: usize,
     devices: Vec<Arc<CudaDevice>>,
@@ -358,7 +357,57 @@ enum BatchResult {
     NotFound {
         hash_count: u64,
     },
+    Overflow {
+        hash_count: u64,
+    },
     DeviceLost,
+}
+
+/// Tracks logical progress separately from physical hashes spent on replays.
+struct BatchCursor {
+    start: U512,
+    end: U512,
+    configured_cap: u32,
+    cap: u32,
+}
+
+impl BatchCursor {
+    fn new(range: Range, cap: u32) -> Self {
+        Self {
+            start: range.start,
+            end: range.end,
+            configured_cap: cap,
+            cap,
+        }
+    }
+
+    fn batch_size(&self) -> u32 {
+        let remaining = self
+            .end
+            .saturating_sub(self.start)
+            .saturating_add(U512::one());
+        remaining
+            .min(nonces_until_low64_carry(self.start))
+            .min(U512::from(self.cap))
+            .low_u32()
+    }
+
+    fn replay_overflow(&mut self, batch_size: u32) {
+        // An overflowing launch has more than MAX_HITS nonces, so halving
+        // strictly shrinks it. A batch of at most MAX_HITS cannot overflow.
+        self.cap = (batch_size / 2).max(1);
+    }
+
+    fn advance(&mut self, batch_size: u32) -> bool {
+        // Compare the last evaluated nonce instead of saturating the next
+        // start: saturation would replay U512::MAX forever.
+        if U512::from(batch_size - 1) >= self.end - self.start {
+            return false;
+        }
+        self.start += U512::from(batch_size);
+        self.cap = self.configured_cap;
+        true
+    }
 }
 
 fn nonces_until_low64_carry(nonce: U512) -> U512 {
@@ -421,11 +470,14 @@ fn run_single_batch(
     if hits > MAX_HITS {
         log::warn!(
             target: "cuda_engine",
-            "CUDA launch produced {hits} candidates, only {MAX_HITS} were recorded; the rest are skipped"
+            "CUDA launch produced {hits} candidates, more than {MAX_HITS} fit; replaying a smaller batch"
         );
+        return BatchResult::Overflow {
+            hash_count: dispatched,
+        };
     }
     let mut best: Option<(U512, U512)> = None;
-    for &index in &result_u32s[1..=hits.min(MAX_HITS)] {
+    for &index in &result_u32s[1..1 + hits] {
         let logical_index = index as u64;
         if logical_index >= dispatched {
             log::error!(
@@ -527,7 +579,7 @@ impl MinerEngine for CudaEngine {
 
         let search_start = Instant::now();
         let mut total_hashes: u64 = 0;
-        let mut current_start = range.start;
+        let mut cursor = BatchCursor::new(range.clone(), self.batch_size);
         let mut batch_num = 0u64;
 
         let duty = WORKER_BUFFERS.with(|cell| {
@@ -547,30 +599,19 @@ impl MinerEngine for CudaEngine {
             duty.map_or(String::new(), |d| format!(", GPU busy {d:.1}% since previous search"))
         );
 
-        while current_start <= range.end {
+        loop {
             if cancel.is_cancelled() {
                 return EngineStatus::Cancelled {
                     hash_count: total_hashes,
                 };
             }
 
-            let remaining = range
-                .end
-                .saturating_sub(current_start)
-                .saturating_add(U512::one());
-            let headroom = nonces_until_low64_carry(current_start);
-            let cap = remaining.min(headroom);
-            let batch_size_u512 = U512::from(self.batch_size);
-            let this_batch_size: u32 = if cap > batch_size_u512 {
-                self.batch_size
-            } else {
-                cap.low_u32()
-            };
+            let this_batch_size = cursor.batch_size();
 
             let batch_result = WORKER_BUFFERS.with(|cell| {
                 let mut slot = cell.borrow_mut();
                 let buffers = slot.as_mut().expect("CUDA buffers initialized");
-                run_single_batch(buffers, ctx, current_start, this_batch_size)
+                run_single_batch(buffers, ctx, cursor.start, this_batch_size)
             });
 
             match batch_result {
@@ -578,7 +619,7 @@ impl MinerEngine for CudaEngine {
                     candidate,
                     hash_count,
                 } => {
-                    total_hashes += hash_count;
+                    total_hashes = total_hashes.saturating_add(hash_count);
                     return EngineStatus::Found {
                         candidate,
                         hash_count: total_hashes,
@@ -586,7 +627,12 @@ impl MinerEngine for CudaEngine {
                     };
                 }
                 BatchResult::NotFound { hash_count } => {
-                    total_hashes += hash_count;
+                    total_hashes = total_hashes.saturating_add(hash_count);
+                }
+                BatchResult::Overflow { hash_count } => {
+                    total_hashes = total_hashes.saturating_add(hash_count);
+                    cursor.replay_overflow(this_batch_size);
+                    continue;
                 }
                 BatchResult::DeviceLost => {
                     DEVICE_LOST.with(|lost| *lost.borrow_mut() = Some(self.engine_id));
@@ -597,10 +643,12 @@ impl MinerEngine for CudaEngine {
                 }
             }
 
-            current_start = current_start.saturating_add(U512::from(this_batch_size));
+            if !cursor.advance(this_batch_size) {
+                break;
+            }
             batch_num += 1;
 
-            if self.throttle_ms > 0 && current_start <= range.end {
+            if self.throttle_ms > 0 {
                 let sleep_interval =
                     std::time::Duration::from_millis((self.throttle_ms / 10).max(1));
                 let mut remaining = std::time::Duration::from_millis(self.throttle_ms);
@@ -682,6 +730,202 @@ mod tests {
             nonces_until_low64_carry((U512::one() << 192) + U512::from(1u64)),
             (U512::one() << 64) - U512::one()
         );
+    }
+
+    #[test]
+    fn overflow_replays_same_start_and_restores_cap_after_progress() {
+        let mut cursor = BatchCursor::new(
+            Range {
+                start: U512::from(100u64),
+                end: U512::from(200u64),
+            },
+            33,
+        );
+        let mut physical_hashes = 0;
+        for expected in [33, 16, 8] {
+            assert_eq!(cursor.batch_size(), expected);
+            assert_eq!(cursor.start, U512::from(100u64));
+            physical_hashes += expected;
+            if expected > MAX_HITS as u32 {
+                cursor.replay_overflow(expected);
+            }
+        }
+        assert_eq!(physical_hashes, 57);
+        assert!(cursor.advance(8));
+        assert_eq!(cursor.start, U512::from(108u64));
+        assert_eq!(cursor.batch_size(), 33);
+    }
+
+    #[test]
+    fn batch_cursor_reduction_terminates_and_respects_range_and_carry() {
+        let mut cursor = BatchCursor::new(
+            Range {
+                start: U512::from(u64::MAX - 10),
+                end: U512::from(u64::MAX) + U512::from(100u64),
+            },
+            u32::MAX,
+        );
+        assert_eq!(cursor.batch_size(), 11);
+        cursor.replay_overflow(11);
+        assert_eq!(cursor.batch_size(), 5);
+        assert!(cursor.advance(5));
+        assert_eq!(cursor.batch_size(), 6);
+        assert!(cursor.advance(6));
+        assert_eq!(cursor.start, U512::from(u64::MAX) + U512::one());
+        assert_eq!(cursor.batch_size(), 100);
+        assert!(!cursor.advance(100));
+
+        let mut cursor = BatchCursor::new(
+            Range {
+                start: U512::zero(),
+                end: U512::MAX,
+            },
+            u32::MAX,
+        );
+        while cursor.batch_size() > MAX_HITS as u32 {
+            let previous = cursor.batch_size();
+            cursor.replay_overflow(previous);
+            assert!(cursor.batch_size() < previous);
+        }
+        assert!(cursor.batch_size() > 0);
+    }
+
+    #[test]
+    fn batch_cursor_terminates_at_u512_max_without_wrapping() {
+        let mut cursor = BatchCursor::new(
+            Range {
+                start: U512::MAX - U512::from(2u64),
+                end: U512::MAX,
+            },
+            2,
+        );
+        assert_eq!(cursor.batch_size(), 2);
+        assert!(cursor.advance(2));
+        assert_eq!(cursor.start, U512::MAX);
+        assert_eq!(cursor.batch_size(), 1);
+        assert!(!cursor.advance(1));
+    }
+
+    #[test]
+    fn cuda_dense_target_overflow_returns_lowest_and_all_shares_by_resume() {
+        let Some(engine) = engine_or_skip_with(33) else {
+            return;
+        };
+        let ctx = JobContext {
+            header: decode32(pow_core::NONCE_HASH_KVS[0].header),
+            difficulty: U512::one(),
+            target: U512::MAX,
+        };
+        let cancelled = AtomicBool::new(false);
+        let start = U512::from(100u64);
+        let end = start + U512::from(32u64);
+        // Assert this fixture really fills the device buffer, regardless of
+        // atomic claim order, before testing the replay path.
+        let mut buffers = create_buffers(engine.engine_id, 0, &engine.devices[0], 1).unwrap();
+        assert!(matches!(
+            run_single_batch(&mut buffers, &ctx, start, 33),
+            BatchResult::Overflow { hash_count: 33 }
+        ));
+        let expected: Vec<_> = (0..33u64)
+            .map(|i| start + U512::from(i))
+            .filter(|&nonce| pow_core::hash_from_nonce(&ctx, nonce) < ctx.target)
+            .collect();
+        let mut resumed_start = start;
+        let mut found = Vec::new();
+        loop {
+            match engine.search_range(
+                &ctx,
+                Range {
+                    start: resumed_start,
+                    end,
+                },
+                &AtomicBoolCancelCheck(&cancelled),
+            ) {
+                EngineStatus::Found {
+                    candidate,
+                    hash_count,
+                    origin: FoundOrigin::Cuda,
+                } => {
+                    assert_eq!(
+                        candidate.hash,
+                        pow_core::hash_from_nonce(&ctx, candidate.nonce)
+                    );
+                    assert_eq!(candidate.work, candidate.nonce.to_big_endian());
+                    if found.is_empty() {
+                        assert_eq!(candidate.nonce, expected[0]);
+                        assert_eq!(hash_count, 33 + 16 + 8);
+                    }
+                    found.push(candidate.nonce);
+                    if candidate.nonce == end {
+                        break;
+                    }
+                    resumed_start = candidate.nonce + U512::one();
+                }
+                EngineStatus::Exhausted { .. } => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(found, expected);
+        CudaEngine::clear_worker_resources();
+    }
+
+    #[test]
+    fn cuda_overflow_replay_observes_cancellation() {
+        let Some(engine) = engine_or_skip_with(33) else {
+            return;
+        };
+        struct CancelAfterFirstLaunch(AtomicUsize);
+        impl CancelCheck for CancelAfterFirstLaunch {
+            fn is_cancelled(&self) -> bool {
+                // Initial entry and first loop check pass; the next loop
+                // check cancels before the overflowing batch is replayed.
+                self.0.fetch_add(1, Ordering::Relaxed) >= 2
+            }
+        }
+        let ctx = JobContext {
+            header: decode32(pow_core::NONCE_HASH_KVS[0].header),
+            difficulty: U512::one(),
+            target: U512::MAX,
+        };
+        assert!(matches!(
+            engine.search_range(
+                &ctx,
+                Range {
+                    start: U512::zero(),
+                    end: U512::from(32u64)
+                },
+                &CancelAfterFirstLaunch(AtomicUsize::new(0)),
+            ),
+            EngineStatus::Cancelled { hash_count: 33 }
+        ));
+        CudaEngine::clear_worker_resources();
+    }
+
+    #[test]
+    fn cuda_zero_hits_exhaust_at_u512_max_and_precancel_does_no_work() {
+        let Some(engine) = engine_or_skip_with(33) else {
+            return;
+        };
+        let ctx = JobContext {
+            header: decode32(pow_core::NONCE_HASH_KVS[0].header),
+            difficulty: U512::one(),
+            target: U512::zero(),
+        };
+        let range = Range {
+            start: U512::MAX - U512::from(32u64),
+            end: U512::MAX,
+        };
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            engine.search_range(&ctx, range.clone(), &AtomicBoolCancelCheck(&cancelled)),
+            EngineStatus::Cancelled { hash_count: 0 }
+        ));
+        cancelled.store(false, Ordering::Relaxed);
+        assert!(matches!(
+            engine.search_range(&ctx, range, &AtomicBoolCancelCheck(&cancelled)),
+            EngineStatus::Exhausted { hash_count: 33 }
+        ));
+        CudaEngine::clear_worker_resources();
     }
 
     #[test]
