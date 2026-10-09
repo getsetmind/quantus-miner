@@ -48,6 +48,27 @@ skip when these are unavailable. A successful test harness with skipped GPU
 tests is **not a GPU correctness pass**. Run the CUDA tests on the intended
 GPU and retain their output before treating GPU changes as verified.
 
+### NVRTC compilation without a GPU
+
+`scripts/check_nvrtc.py` compiles the embedded kernel for `compute_86` using
+an explicitly selected NVRTC library, without executing any GPU code:
+
+```sh
+python scripts/check_nvrtc.py --library /path/to/libnvrtc.so.12
+```
+
+On Windows, supply the actual NVRTC DLL path instead. Keep its matching
+builtins library alongside it. Compilation success is not GPU correctness or
+performance validation.
+
+A Windows RTX 3060 run rejected the upstream `=&r` asm constraints. The fix
+uses block-local PTX registers and only publishes output operands after all
+inputs have been consumed, rather than simply removing early-clobber markers.
+On Linux both the original and corrected source compiled with NVRTC 12.4.127
+and 13.4.92; the reported failure was not reproduced on Linux. Windows retry
+and GPU correctness tests are still required. The runtime now logs NVRTC's
+major/minor version to help distinguish actual compiler configurations.
+
 ## Bounded Windows GPU trial
 
 Only run this after choosing to start real mining. This command sends shares

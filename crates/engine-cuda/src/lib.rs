@@ -257,6 +257,11 @@ fn nvrtc_supported_archs() -> Result<Vec<i32>, String> {
 /// can run. The driver JIT then emits native code; on a 4090 that measured
 /// equal to loading NVRTC's own cubin, so the PTX route is kept.
 fn compile_kernel(major: i32, minor: i32) -> Result<Ptx, Box<dyn std::error::Error>> {
+    let (mut nvrtc_major, mut nvrtc_minor) = (0, 0);
+    unsafe { nvrtc_sys::nvrtcVersion(&mut nvrtc_major, &mut nvrtc_minor) }
+        .result()
+        .map_err(|e| format!("nvrtcVersion failed: {e:?}"))?;
+    log::info!(target: "cuda_engine", "NVRTC compiler version {nvrtc_major}.{nvrtc_minor}");
     let device_arch = major * 10 + minor;
     let target = nvrtc_supported_archs()?
         .into_iter()

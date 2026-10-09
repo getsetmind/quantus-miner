@@ -78,15 +78,19 @@ __constant__ u64 MDS_DIAG[12] = {
 __device__ __forceinline__ u64 gf64_add(u64 a, u64 b) {
     u32 a0 = (u32)a, a1 = (u32)(a >> 32), b0 = (u32)b, b1 = (u32)(b >> 32);
     u32 o0, o1;
+    // Some NVRTC toolchains reject early-clobber; publish after all input uses.
     asm("{\n\t"
+        ".reg .u32 out0, out1;\n\t"
         ".reg .u32 c;\n\t"
-        "add.cc.u32 %0, %2, %4;\n\t"
-        "addc.cc.u32 %1, %3, %5;\n\t"
+        "add.cc.u32 out0, %2, %4;\n\t"
+        "addc.cc.u32 out1, %3, %5;\n\t"
         "addc.u32 c, 0, 0;\n\t"
-        "mad.lo.cc.u32 %0, c, %6, %0;\n\t"
-        "madc.hi.u32 %1, c, %6, %1;\n\t"
+        "mad.lo.cc.u32 out0, c, %6, out0;\n\t"
+        "madc.hi.u32 out1, c, %6, out1;\n\t"
+        "mov.b32 %0, out0;\n\t"
+        "mov.b32 %1, out1;\n\t"
         "}"
-        : "=&r"(o0), "=&r"(o1)
+        : "=r"(o0), "=r"(o1)
         : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "r"(EPS32));
     return ((u64)o1 << 32) | (u64)o0;
 }
@@ -111,16 +115,20 @@ __device__ __forceinline__ void mul64wide(u64 a, u64 b, u32 &r0, u32 &r1,
 // bit-exact results are not required for mining, only for verification.
 __device__ __forceinline__ u64 reduce128(u32 r0, u32 r1, u32 r2, u32 r3) {
     u32 o0, o1;
+    // Some NVRTC toolchains reject early-clobber; publish after all input uses.
     asm("{\n\t"
+        ".reg .u32 out0, out1;\n\t"
         ".reg .u32 c;\n\t"
-        "mad.lo.cc.u32 %0, %4, %6, %2;\n\t"
-        "madc.hi.cc.u32 %1, %4, %6, %3;\n\t"
+        "mad.lo.cc.u32 out0, %4, %6, %2;\n\t"
+        "madc.hi.cc.u32 out1, %4, %6, %3;\n\t"
         "addc.u32 c, %5, 0;\n\t"
-        "addc.u32 %1, %1, 0;\n\t"
-        "sub.cc.u32 %0, %0, c;\n\t"
-        "subc.u32 %1, %1, 0;\n\t"
+        "addc.u32 out1, out1, 0;\n\t"
+        "sub.cc.u32 out0, out0, c;\n\t"
+        "subc.u32 out1, out1, 0;\n\t"
+        "mov.b32 %0, out0;\n\t"
+        "mov.b32 %1, out1;\n\t"
         "}"
-        : "=&r"(o0), "=&r"(o1)
+        : "=r"(o0), "=r"(o1)
         : "r"(r0), "r"(r1), "r"(r2), "r"(r3), "r"(EPS32));
     return ((u64)o1 << 32) | (u64)o0;
 }
@@ -140,12 +148,17 @@ __device__ __forceinline__ u64 gf64_sqr(u64 a) {
     u64 mid = lh << 1;
     u32 mid_top = (u32)(lh >> 63);
     u32 r0 = (u32)ll, r1, r2, r3;
+    // Some NVRTC toolchains reject early-clobber; publish after all input uses.
     asm("{\n\t"
-        "add.cc.u32 %0, %3, %4;\n\t"
-        "addc.cc.u32 %1, %5, %6;\n\t"
-        "addc.u32 %2, %7, %8;\n\t"
+        ".reg .u32 out0, out1, out2;\n\t"
+        "add.cc.u32 out0, %3, %4;\n\t"
+        "addc.cc.u32 out1, %5, %6;\n\t"
+        "addc.u32 out2, %7, %8;\n\t"
+        "mov.b32 %0, out0;\n\t"
+        "mov.b32 %1, out1;\n\t"
+        "mov.b32 %2, out2;\n\t"
         "}"
-        : "=&r"(r1), "=&r"(r2), "=&r"(r3)
+        : "=r"(r1), "=r"(r2), "=r"(r3)
         : "r"((u32)(ll >> 32)), "r"((u32)mid), "r"((u32)hh),
           "r"((u32)(mid >> 32)), "r"((u32)(hh >> 32)), "r"(mid_top));
     return reduce128(r0, r1, r2, r3);
@@ -224,23 +237,29 @@ __device__ __forceinline__ void mul128_add_wide(u64 a, u64 b, const Wide &w,
                                                 u32 &r3) {
     u32 a0 = (u32)a, a1 = (u32)(a >> 32), b0 = (u32)b, b1 = (u32)(b >> 32);
     u64 w0 = w.l0, w1 = w.l1, w2 = w.h;
+    // Some NVRTC toolchains reject early-clobber; publish after all input uses.
     asm("{\n\t"
+        ".reg .u32 out0, out1, out2, out3;\n\t"
         ".reg .b64 p0, m, m2, p3;\n\t"
         ".reg .b32 m0, m1, p0h, p3l, p3h, cw;\n\t"
         "mad.wide.u32 p0, %4, %6, %8;\n\t"
         "mad.wide.u32 m, %5, %6, %9;\n\t"
         "mul.wide.u32 m2, %4, %7;\n\t"
         "mad.wide.u32 p3, %5, %7, %10;\n\t"
-        "mov.b64 {%0, p0h}, p0;\n\t"
+        "mov.b64 {out0, p0h}, p0;\n\t"
         "mov.b64 {p3l, p3h}, p3;\n\t"
         "add.cc.u64 m, m, m2;\n\t"
         "addc.u32 cw, p3h, 0;\n\t"
         "mov.b64 {m0, m1}, m;\n\t"
-        "add.cc.u32 %1, p0h, m0;\n\t"
-        "addc.cc.u32 %2, p3l, m1;\n\t"
-        "addc.u32 %3, cw, 0;\n\t"
+        "add.cc.u32 out1, p0h, m0;\n\t"
+        "addc.cc.u32 out2, p3l, m1;\n\t"
+        "addc.u32 out3, cw, 0;\n\t"
+        "mov.b32 %0, out0;\n\t"
+        "mov.b32 %1, out1;\n\t"
+        "mov.b32 %2, out2;\n\t"
+        "mov.b32 %3, out3;\n\t"
         "}"
-        : "=&r"(r0), "=&r"(r1), "=&r"(r2), "=&r"(r3)
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
         : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "l"(w0), "l"(w1), "l"(w2));
 }
 
