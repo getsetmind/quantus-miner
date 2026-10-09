@@ -1,8 +1,9 @@
 # Experimental Suprnova Stratum client
 
 This fork adds a separate `stratum` command. Existing `serve` (native QUIC)
-and `benchmark` commands remain available. The first target is one worker and
-one visible NVIDIA GPU, with verified TLS and bounded sessions.
+and `benchmark` commands remain available. It supports explicit CUDA-visible device selection, coordinated workers,
+opt-in alternate TLS endpoints and optional read-only telemetry, with verified
+TLS and bounded sessions. Operational extensions are cloud/mock-tested only.
 
 ## What is verified
 
@@ -42,6 +43,20 @@ On the cloud Linux host, Rust 1.93.0:
 - Clean timed stop; pool screenshot reflected one worker
 - The pool's 535.71 MH/s estimate is a short-window accounting estimate,
   separate from the measured local benchmark
+
+### Later user-run baseline (2026-10-09)
+
+On Windows RTX 3060 with driver 617.42, after background applications were
+closed, a local 32M-batch ten-second benchmark measured 146.52 MH/s. A bounded
+4M-batch 120-second Stratum trial recorded 16.16 billion physical hashes, or
+134.667 MH/s over the nominal interval, with no reconnects, rejected,
+unacknowledged or stale shares and no submitted candidates. Zero accepted
+shares in that short trial is inconclusive. Before closing applications, a
+local benchmark measured 110.80 MH/s with SM clocks around 1900 MHz. These are
+observations under changed conditions, not proof of an application-specific
+cause, a kernel improvement, or sustained 140 MH/s. The active release baseline
+at commit `1554303858167da9a69298a2447783e436f194b7` is preserved separately
+from these operational changes.
 
 Each reconnect followed a keepalive rejection around the 30-second interval.
 The actual reply payload was not captured. The pinned [NOMP Quantus wire
@@ -108,10 +123,28 @@ public root certificates and normal hostname validation. There is no
 certificate-bypass flag and no plaintext fallback. A TLS failure is a failure
 to investigate, not a reason to turn off verification.
 
-If more than one CUDA GPU is visible, select one in the invoking process
-with `CUDA_VISIBLE_DEVICES` before launching. Multi-GPU coordination is outside
-this first implementation's scope. `--engine cpu` selects a single CPU worker
-for troubleshooting, not an automatic fallback when CUDA fails.
+CUDA device 0 is selected by default, even when more GPUs are visible. Select
+explicit CUDA-visible ordinals with `--cuda-devices 0,1`; `CUDA_VISIBLE_DEVICES`
+can change those ordinal mappings. Each selected GPU has its own worker/engine
+and disjoint per-run/generation nonce partition. All devices share one pool
+login. A worker/device failure stops all devices rather than silently continuing
+with a partial rig. Multi-GPU hardware execution has not been tested here.
+`--engine cpu` selects a single CPU troubleshooting worker, never an automatic
+fallback when CUDA fails.
+
+Optional `--fallback-pool backup.example:7074` flags configure an ordered TLS
+failover list. Endpoints rotate on connection/session failure within the shared
+`--reconnect-attempts` budget, then return to the primary. Empty means no alternate
+pool. Every connection verifies the selected hostname/certificate; TLS failures
+never trigger plaintext. Selecting a pool also selects the operator receiving
+your public payout address, worker label and shares. No endpoint is inferred.
+Each session logs in afresh; pending shares are counted unacknowledged and never
+replayed. Real alternate-pool compatibility has not been tested.
+
+`--gpu-telemetry-interval 5` enables optional continuous read-only nvidia-smi
+logging (0 disables it). Local hash/share/reconnect statistics remain logged
+without a network listener. See the [operational launcher/distribution kit](stratum-operations.md)
+and [protocol evidence and conservative updates](stratum-protocol-reference.md).
 
 The duration defaults to 120 seconds and is capped at 24 hours per invocation.
 Ctrl+C also requests shutdown. A GPU/driver call that is already blocked can
@@ -193,8 +226,11 @@ invalid submitted shares, but does not recover valid shares the kernel failed
 to detect. Raw H/s and accepted work are therefore separate measurements.
 
 The reference protocol implementations use the same general login/job/submit
-dialect, but do not prove every Suprnova extension. Unsupported difficulty
-updates must stop/cancel work rather than continue with a stale target.
+dialect, but do not prove every Suprnova extension. Difficulty/target changes
+are supported only through fully validated `job` notifications. A login may
+return a null job while waiting for a later notification. Unknown methods,
+fields, partial difficulty/target/extranonce updates, and unsupported clean-job
+policies stop/cancel work rather than continue with a stale target.
 
 ## First live-test acceptance criteria
 

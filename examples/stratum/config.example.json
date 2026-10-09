@@ -1,0 +1,14 @@
+{
+  "wallet": "REPLACE_WITH_YOUR_PUBLIC_QZ_PAYOUT_ADDRESS",
+  "worker": "rig1",
+  "duration": 120,
+  "engine": "cuda",
+  "poolHost": "quantus.suprnova.cc",
+  "poolPort": 7074,
+  "fallbackPools": [],
+  "cudaDevices": "0",
+  "gpuBatchSize": 1000000,
+  "gpuThrottleMs": 0,
+  "reconnectAttempts": 3,
+  "gpuTelemetryInterval": 15
+}

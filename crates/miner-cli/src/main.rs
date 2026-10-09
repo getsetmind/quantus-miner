@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod gpu_telemetry;
 mod stratum_cli;
 
 // CLI defaults
@@ -18,7 +19,7 @@ const DEFAULT_CPU_BATCH_SIZE: u64 = 10_000;
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run a bounded single-worker TLS Stratum pool session (experimental)
+    /// Run a bounded TLS Stratum pool session (experimental)
     Stratum(stratum_cli::StratumArgs),
     /// Run the mining service
     Serve {
@@ -544,3 +545,6 @@ fn format_hash_rate(rate: f64) -> String {
         format!("{:.0}", rate)
     }
 }
+
+#[cfg(test)]
+mod stratum_argument_tests;

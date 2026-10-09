@@ -1,7 +1,9 @@
 # External Miner Service for Quantus Network
 
-This fork also contains an **experimental single-worker TLS Stratum client**
-for Suprnova. See [setup, test status and safety limits](docs/suprnova-stratum.md).
+This fork also contains an **experimental TLS Stratum client**
+for Suprnova, with explicit CUDA device selection and opt-in TLS failover.
+See [setup, test status and safety limits](docs/suprnova-stratum.md) and the
+[bounded launcher, distribution kit and read-only monitor](docs/stratum-operations.md).
 The native QUIC `serve` command is unchanged; use the separate `stratum`
 command only for an explicitly requested pool-mining session.
 

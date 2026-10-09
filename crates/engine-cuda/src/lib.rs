@@ -85,8 +85,43 @@ thread_local! {
     static DEVICE_LOST: RefCell<Option<usize>> = const { RefCell::new(None) };
 }
 
+fn select_ordinals(
+    count: usize,
+    ordinals: Option<&[usize]>,
+) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+    let selected = ordinals.map_or_else(|| (0..count).collect::<Vec<_>>(), <[usize]>::to_vec);
+    if selected.is_empty()
+        || selected.len() > count
+        || selected.iter().any(|&n| n >= count)
+        || selected
+            .iter()
+            .enumerate()
+            .any(|(i, n)| selected[..i].contains(n))
+    {
+        return Err("CUDA device selection must contain distinct valid visible ordinals".into());
+    }
+    Ok(selected)
+}
+
 impl CudaEngine {
     pub fn try_new(batch_size: u32, throttle_ms: u64) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::try_new_selected(batch_size, throttle_ms, None)
+    }
+
+    /// Select CUDA-visible ordinals explicitly, without initializing other GPUs.
+    pub fn try_new_on_devices(
+        batch_size: u32,
+        throttle_ms: u64,
+        ordinals: &[usize],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::try_new_selected(batch_size, throttle_ms, Some(ordinals))
+    }
+
+    fn try_new_selected(
+        batch_size: u32,
+        throttle_ms: u64,
+        ordinals: Option<&[usize]>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         if batch_size == 0 {
             return Err("batch_size must be non-zero".into());
         }
@@ -109,9 +144,10 @@ impl CudaEngine {
             return Err("No CUDA devices found".into());
         }
 
+        let selected = select_ordinals(count as usize, ordinals)?;
         let mut devices = Vec::new();
         let mut compiled: HashMap<(i32, i32), Ptx> = HashMap::new();
-        for ordinal in 0..count as usize {
+        for ordinal in selected {
             let ctx = CudaContext::new(ordinal)
                 .map_err(|e| format!("Failed to create CUDA context for device {ordinal}: {e}"))?;
             ctx.set_blocking_synchronize().map_err(|e| {
@@ -174,6 +210,43 @@ impl CudaEngine {
             batch_size,
             throttle_ms,
         })
+    }
+
+    /// One independently identified engine per selected device. Each pool worker
+    /// owns one engine, so scheduling order cannot alter its device assignment.
+    pub fn into_device_engines(self) -> Vec<Self> {
+        self.devices
+            .into_iter()
+            .map(|device| Self {
+                engine_id: ENGINE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
+                devices: vec![device],
+                device_counter: AtomicUsize::new(0),
+                batch_size: self.batch_size,
+                throttle_ms: self.throttle_ms,
+            })
+            .collect()
+    }
+
+    /// Stable device UUID for read-only telemetry matching. A multi-device
+    /// engine cannot supply one UUID; split it into explicit device engines.
+    pub fn device_uuid(&self) -> Result<String, Box<dyn std::error::Error>> {
+        if self.devices.len() != 1 {
+            return Err("device UUID requires a single-device engine".into());
+        }
+        let uuid = self.devices[0].ctx.uuid()?;
+        let hex = uuid
+            .bytes
+            .iter()
+            .map(|&byte| format!("{:02x}", byte as u8))
+            .collect::<String>();
+        Ok(format!(
+            "GPU-{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        ))
     }
 
     pub fn device_count(&self) -> usize {
@@ -1352,3 +1425,6 @@ mod tests {
         CudaEngine::clear_worker_resources();
     }
 }
+
+#[cfg(test)]
+mod device_selection_tests;

@@ -3,7 +3,7 @@
 use anyhow::{anyhow, bail, Result};
 use clap::{Args, ValueEnum};
 use engine_cpu::{FastCpuEngine, MinerEngine};
-use std::sync::Arc;
+use std::sync::{atomic::AtomicU64, Arc};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -30,9 +30,21 @@ pub(crate) struct StratumArgs {
     #[arg(long, default_value_t = 7074, value_parser = clap::value_parser!(u16).range(1..))]
     pool_port: u16,
 
-    /// One CPU worker or one visible CUDA GPU; no automatic fallback
+    /// One CPU worker or explicitly selected CUDA GPUs; no automatic engine fallback
     #[arg(long, value_enum, default_value = "cuda")]
     engine: Engine,
+
+    /// Explicit CUDA-visible ordinals, comma-separated (default: device 0)
+    #[arg(long, value_delimiter = ',', num_args = 1.., default_value = "0")]
+    cuda_devices: Vec<usize>,
+
+    /// Explicit alternate TLS hostname:port; repeat for an ordered failover list
+    #[arg(long, value_parser = validate_endpoint)]
+    fallback_pool: Vec<String>,
+
+    /// Read-only nvidia-smi sampling interval in seconds; 0 disables telemetry
+    #[arg(long, default_value_t = 0, value_parser = validate_telemetry_interval)]
+    gpu_telemetry_interval: u64,
 
     /// Session duration in seconds, then stop (also stop with Ctrl+C)
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=86400))]
@@ -52,6 +64,18 @@ pub(crate) struct StratumArgs {
 
     #[arg(short, long)]
     pub verbose: bool,
+}
+
+fn validate_endpoint(value: &str) -> std::result::Result<String, String> {
+    stratum_service::Endpoint::parse(value).map_err(|e| e.to_string())?;
+    Ok(value.to_owned())
+}
+fn validate_telemetry_interval(value: &str) -> std::result::Result<u64, String> {
+    let seconds: u64 = value.parse().map_err(|_| "expected seconds".to_owned())?;
+    if seconds != 0 && !(5..=3600).contains(&seconds) {
+        return Err("telemetry interval must be 0 or 5..3600 seconds".into());
+    }
+    Ok(seconds)
 }
 
 fn validate_wallet(value: &str) -> std::result::Result<String, String> {
@@ -87,20 +111,59 @@ pub(crate) async fn run(args: StratumArgs) -> Result<()> {
     {
         bail!("pool-host must be a TLS hostname without a scheme, path, or port");
     }
-    let engine: Arc<dyn MinerEngine> = match args.engine {
-        Engine::Cpu => Arc::new(FastCpuEngine::new(256)),
-        Engine::Cuda => {
-            let cuda = engine_cuda::CudaEngine::try_new(args.gpu_batch_size, args.gpu_throttle_ms)
-                .map_err(|error| anyhow!("CUDA initialization failed: {error}"))?;
-            if cuda.device_count() != 1 {
-                bail!("experimental Stratum mode requires exactly one visible CUDA GPU; use CUDA_VISIBLE_DEVICES to select one");
+    if args.cuda_devices.is_empty()
+        || args.cuda_devices.len() > 64
+        || args
+            .cuda_devices
+            .iter()
+            .enumerate()
+            .any(|(i, n)| args.cuda_devices[..i].contains(n))
+    {
+        bail!("select 1..64 distinct CUDA-visible ordinals");
+    }
+    if args.fallback_pool.len() > 8 {
+        bail!("at most eight explicit TLS fallback pools");
+    }
+    let mut selected_uuids = Vec::new();
+    let engines: Vec<Arc<dyn MinerEngine>> = match args.engine {
+        Engine::Cpu => {
+            if args.cuda_devices != [0] {
+                bail!("cuda-devices is only supported with the CUDA engine");
             }
-            Arc::new(cuda)
+            vec![Arc::new(FastCpuEngine::new(256))]
+        }
+        Engine::Cuda => {
+            let cuda = engine_cuda::CudaEngine::try_new_on_devices(
+                args.gpu_batch_size,
+                args.gpu_throttle_ms,
+                &args.cuda_devices,
+            )
+            .map_err(|error| anyhow!("CUDA initialization failed: {error}"))?;
+            let devices = cuda.into_device_engines();
+            let uuids = devices
+                .iter()
+                .map(|device| device.device_uuid())
+                .collect::<std::result::Result<Vec<_>, _>>();
+            match uuids {
+                Ok(uuids) => selected_uuids = uuids,
+                Err(_) => log::warn!(
+                    "Selected GPU UUID mapping unavailable; efficiency monitoring disabled"
+                ),
+            }
+            devices
+                .into_iter()
+                .map(|engine| Arc::new(engine) as Arc<dyn MinerEngine>)
+                .collect()
         }
     };
     let config = stratum_service::Config {
         host: args.pool_host,
         port: args.pool_port,
+        fallback_pools: args
+            .fallback_pool
+            .iter()
+            .map(|s| stratum_service::Endpoint::parse(s))
+            .collect::<Result<Vec<_>>>()?,
         login: format!("{}.{}", args.wallet, args.worker),
         password: "x".to_owned(),
         agent: format!("quantus-miner-stratum/{}", env!("CARGO_PKG_VERSION")),
@@ -111,6 +174,18 @@ pub(crate) async fn run(args: StratumArgs) -> Result<()> {
         range_size: u64::from(args.gpu_batch_size),
     };
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let hashes = Arc::new(AtomicU64::new(0));
+    let monitor = (!selected_uuids.is_empty()).then(|| crate::gpu_telemetry::MiningMonitor {
+        selected_uuids,
+        hashes: hashes.clone(),
+    });
+    let telemetry = (args.gpu_telemetry_interval > 0).then(|| {
+        tokio::spawn(crate::gpu_telemetry::run(
+            Duration::from_secs(args.gpu_telemetry_interval),
+            shutdown_rx.clone(),
+            monitor,
+        ))
+    });
     let duration = args.duration;
     let timer = tokio::spawn(async move {
         tokio::select! {
@@ -126,8 +201,12 @@ pub(crate) async fn run(args: StratumArgs) -> Result<()> {
         let _ = shutdown_tx.send(true);
     });
     log::info!("Starting experimental TLS Stratum session; stop requested after {duration}s (in-flight GPU work may delay exit)");
-    let result = stratum_service::run(config, engine, shutdown_rx).await;
+    let result = stratum_service::run_multi_observed(config, engines, shutdown_rx, hashes).await;
     timer.abort();
+    if let Some(telemetry) = telemetry {
+        telemetry.abort();
+        let _ = telemetry.await;
+    }
     match result {
         Ok(stats) => {
             log::info!("Stratum session summary: {stats:?}");

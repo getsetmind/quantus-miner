@@ -1,25 +1,27 @@
 use super::*;
 use engine_cpu::FastCpuEngine;
 
-fn fixture() -> Value {
+pub(super) fn fixture() -> Value {
     json!({"algo":"qpow-poseidon2","difficulty":10000000000u64,"extranonce":"01002807","job_id":"141589","mining_hash":"3b7dfe994ef7f0724a96540c547724153b02c9a0bfc1e166872411d9b2cf8a4a","seq":136419,"target":"000000006df37f675ef6eadf5ab9a2072d44268d97df837e6748956e5c6c2117501e68855669e4b8356cf292464d9e16cc8d4655f8fb96f429b149fc87d74da4"})
 }
-fn easy_job() -> Job {
+pub(super) fn easy_job() -> Job {
     let mut v = fixture();
     v["difficulty"] = json!(1);
     v["target"] = json!(hex::encode(U512::MAX.to_big_endian()));
     Job::parse(&v).unwrap()
 }
-fn fake_worker() -> Worker {
+pub(super) fn fake_worker() -> Worker {
     Worker {
         state: Arc::new(WorkerState {
             salt: [0; 16],
-            hashes: AtomicU64::new(0),
+            hashes: Arc::new(AtomicU64::new(0)),
+            failure: Mutex::new(None),
             epoch: AtomicU64::new(0),
             latest: Mutex::new(None),
             wake: Condvar::new(),
         }),
         handle: None,
+        extra_handles: Vec::new(),
     }
 }
 fn candidate(job: &Job, nonce: U512) -> Candidate {

@@ -31,6 +31,14 @@ fn fixed_hex<const N: usize>(value: &Value, field: &str) -> Result<[u8; N]> {
 
 impl Job {
     pub fn parse(value: &Value) -> Result<Self> {
+        let fields = value.as_object().context("job must be an object")?;
+        ensure!(
+            fields.keys().all(|key| matches!(
+                key.as_str(),
+                "algo" | "job_id" | "mining_hash" | "extranonce" | "difficulty" | "target" | "seq"
+            )),
+            "unsupported job field"
+        );
         ensure!(
             value.get("algo").and_then(Value::as_str) == Some("qpow-poseidon2"),
             "unsupported Stratum algorithm"
@@ -79,6 +87,18 @@ impl Job {
             && self.target == other.target
     }
 
+    /// Validate ordering and retain the sequence high-water mark when a
+    /// compatible notification omits it, including across work changes.
+    /// Return a prepared job; compare `same_work` before assigning a new
+    /// worker generation so sequence-only updates preserve the nonce cursor.
+    pub fn reconcile_update(&self, mut next: Self) -> Result<Self> {
+        if let (Some(previous), Some(incoming)) = (self.sequence, next.sequence) {
+            ensure!(incoming >= previous, "out-of-order job sequence");
+        }
+        next.sequence = next.sequence.or(self.sequence);
+        Ok(next)
+    }
+
     pub fn context(&self) -> JobContext {
         JobContext {
             header: self.header,
@@ -103,6 +123,83 @@ impl Job {
             && candidate.work == candidate.nonce.to_big_endian()
             && candidate.hash < self.target
             && pow_core::hash_from_nonce(&self.context(), candidate.nonce) == candidate.hash
+    }
+}
+
+/// Full validated work, or a narrowly bounded local informational extension.
+/// No standalone difficulty/target method is documented by the pinned dialect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Notification {
+    Job(Box<Job>),
+    Notice,
+}
+
+/// Fail closed on every unknown notification, rather than guessing whether a
+/// method name or recursively hidden field changes work. The documented job
+/// wrapper and the client's existing direct-job compatibility are supported.
+/// `notice` is local compatibility, not a claimed Suprnova protocol extension.
+pub fn parse_notification(value: &Value) -> Result<Notification> {
+    let envelope = value
+        .as_object()
+        .context("notification must be an object")?;
+    ensure!(
+        envelope
+            .keys()
+            .all(|key| matches!(key.as_str(), "jsonrpc" | "id" | "method" | "params")),
+        "unsupported notification envelope field"
+    );
+    ensure!(
+        value.get("id").is_none_or(Value::is_null),
+        "notification has a response ID"
+    );
+    ensure!(
+        value
+            .get("jsonrpc")
+            .is_none_or(|v| v.as_str() == Some("2.0")),
+        "unsupported JSON-RPC notification version"
+    );
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .context("missing notification method")?;
+    let params = value.get("params").context("missing notification params")?;
+    let object = params
+        .as_object()
+        .context("notification params must be an object")?;
+    match method {
+        "job" => {
+            let job = if let Some(job) = object.get("job") {
+                ensure!(
+                    object
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "job" | "clean_jobs")),
+                    "unsupported job notification field"
+                );
+                ensure!(
+                    object
+                        .get("clean_jobs")
+                        .is_none_or(|v| v == &Value::Bool(true)),
+                    "unsupported clean_jobs policy"
+                );
+                job
+            } else {
+                params
+            };
+            Ok(Notification::Job(Box::new(Job::parse(job)?)))
+        }
+        "notice" => {
+            ensure!(object.len() == 1, "unsupported notice fields");
+            let message = object
+                .get("message")
+                .and_then(Value::as_str)
+                .context("invalid notice message")?;
+            ensure!(
+                !message.is_empty() && message.len() <= 4096,
+                "invalid notice message length"
+            );
+            Ok(Notification::Notice)
+        }
+        _ => bail!("unsupported Stratum notification; reconnecting safely"),
     }
 }
 

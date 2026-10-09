@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 //! Experimental verified-TLS Quantus Stratum client. A bounded live trial
 //! received accepted shares; ongoing stability still needs validation.
-//! Single correctness-first CPU/CUDA worker.
+//! Explicit correctness-first CPU/CUDA workers with one authenticated session.
 pub mod protocol;
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use engine_cpu::{Candidate, EngineStatus, JobIdCancelCheck, MinerEngine, Range};
 use primitive_types::U512;
 use protocol::{FrameDecoder, Job};
@@ -30,9 +30,44 @@ use tokio_rustls::{
 
 /// No Debug implementation: credentials are never logged.
 #[derive(Clone)]
+pub struct Endpoint {
+    pub host: String,
+    pub port: u16,
+}
+impl Endpoint {
+    pub fn parse(value: &str) -> Result<Self> {
+        let (host, port) = value
+            .rsplit_once(':')
+            .context("TLS endpoint must be hostname:port")?;
+        let endpoint = Self {
+            host: host.into(),
+            port: port.parse().context("invalid TLS endpoint port")?,
+        };
+        endpoint.validate()?;
+        Ok(endpoint)
+    }
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.host.is_empty()
+                && self.host.len() <= 253
+                && self
+                    .host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+                && self.port > 0,
+            "TLS endpoint must be a hostname and positive port"
+        );
+        ServerName::try_from(self.host.clone()).context("invalid TLS hostname")?;
+        Ok(())
+    }
+}
+
+/// No Debug implementation: credentials are never logged.
+#[derive(Clone)]
 pub struct Config {
     pub host: String,
     pub port: u16,
+    pub fallback_pools: Vec<Endpoint>,
     pub login: String,
     pub password: String,
     pub agent: String,
@@ -47,6 +82,7 @@ impl Default for Config {
         Self {
             host: "quantus.suprnova.cc".into(),
             port: 7074,
+            fallback_pools: Vec::new(),
             login: String::new(),
             password: "x".into(),
             agent: "quantus-miner-stratum/0.1".into(),
@@ -59,11 +95,31 @@ impl Default for Config {
     }
 }
 impl Config {
+    fn endpoint(&self, index: usize) -> Endpoint {
+        let index = index % (self.fallback_pools.len() + 1);
+        if index == 0 {
+            Endpoint {
+                host: self.host.clone(),
+                port: self.port,
+            }
+        } else {
+            self.fallback_pools[index - 1].clone()
+        }
+    }
     fn validate(&self) -> Result<()> {
+        Endpoint {
+            host: self.host.clone(),
+            port: self.port,
+        }
+        .validate()?;
         ensure!(
-            !self.host.is_empty() && self.port > 0,
-            "missing Stratum host/port"
+            self.fallback_pools.len() <= 8,
+            "at most eight explicit TLS fallback endpoints"
         );
+        for endpoint in &self.fallback_pools {
+            endpoint.validate()?;
+        }
+        ensure!(self.reconnect_attempts <= 20, "reconnect budget exceeds 20");
         ensure!(
             !self.login.is_empty() && self.login.len() <= 256,
             "invalid Stratum login length"
@@ -98,11 +154,21 @@ struct Assigned {
 }
 struct WorkerState {
     salt: [u8; 16],
-    hashes: AtomicU64,
+    hashes: Arc<AtomicU64>,
+    failure: Mutex<Option<&'static str>>,
     epoch: AtomicU64,
     latest: Mutex<Option<Assigned>>,
     wake: Condvar,
 }
+#[derive(Debug)]
+struct WorkerFailure(&'static str);
+impl std::fmt::Display for WorkerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for WorkerFailure {}
+
 enum WorkerEvent {
     Share(Box<(Assigned, Candidate)>),
     Failed(&'static str),
@@ -110,30 +176,59 @@ enum WorkerEvent {
 struct Worker {
     state: Arc<WorkerState>,
     handle: Option<thread::JoinHandle<()>>,
+    extra_handles: Vec<thread::JoinHandle<()>>,
 }
 impl Worker {
+    #[cfg(test)]
     fn new(engine: Arc<dyn MinerEngine>, range_size: u64) -> (Self, mpsc::Receiver<WorkerEvent>) {
         Self::with_salt(engine, range_size, rand::random())
     }
+    #[cfg(test)]
     fn with_salt(
         engine: Arc<dyn MinerEngine>,
         range_size: u64,
         salt: [u8; 16],
     ) -> (Self, mpsc::Receiver<WorkerEvent>) {
+        Self::with_engines(vec![engine], range_size, salt)
+    }
+    #[cfg(test)]
+    fn with_engines(
+        engines: Vec<Arc<dyn MinerEngine>>,
+        range_size: u64,
+        salt: [u8; 16],
+    ) -> (Self, mpsc::Receiver<WorkerEvent>) {
+        Self::with_hash_counter(engines, range_size, salt, Arc::new(AtomicU64::new(0)))
+    }
+    fn with_hash_counter(
+        engines: Vec<Arc<dyn MinerEngine>>,
+        range_size: u64,
+        salt: [u8; 16],
+        hashes: Arc<AtomicU64>,
+    ) -> (Self, mpsc::Receiver<WorkerEvent>) {
         let state = Arc::new(WorkerState {
             salt,
-            hashes: AtomicU64::new(0),
+            hashes,
+            failure: Mutex::new(None),
             epoch: AtomicU64::new(0),
             latest: Mutex::new(None),
             wake: Condvar::new(),
         });
         let (tx, rx) = mpsc::channel(16);
-        let shared = state.clone();
-        let handle = thread::spawn(move || worker_loop(shared, engine, range_size, tx));
+        let mut handles = engines
+            .into_iter()
+            .enumerate()
+            .map(|(index, engine)| {
+                let shared = state.clone();
+                let sender = tx.clone();
+                thread::spawn(move || worker_loop(shared, engine, range_size, index as u32, sender))
+            })
+            .collect::<Vec<_>>();
+        let handle = handles.remove(0);
         (
             Self {
                 state,
                 handle: Some(handle),
+                extra_handles: handles,
             },
             rx,
         )
@@ -147,7 +242,7 @@ impl Worker {
                 Some(n.saturating_add(1))
             });
         *latest = None;
-        self.state.wake.notify_one();
+        self.state.wake.notify_all();
     }
     fn assign(&self, job: Job) -> Result<Assigned> {
         let generation = self
@@ -160,13 +255,13 @@ impl Worker {
             + 1;
         let assigned = Assigned { generation, job };
         *self.state.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(assigned.clone());
-        self.state.wake.notify_one();
+        self.state.wake.notify_all();
         Ok(assigned)
     }
     fn stop(&self) {
         let _lock = self.state.latest.lock().unwrap_or_else(|e| e.into_inner());
         self.state.epoch.store(u64::MAX, Ordering::SeqCst);
-        self.state.wake.notify_one();
+        self.state.wake.notify_all();
     }
 }
 impl Drop for Worker {
@@ -194,31 +289,73 @@ fn send_event(
         }
     }
 }
+fn report_worker_failure(
+    tx: &mpsc::Sender<WorkerEvent>,
+    state: &WorkerState,
+    _generation: u64,
+    message: &'static str,
+) {
+    // Persist independently of the bounded share queue. Backpressure or a pool
+    // reconnect must never erase a fatal device failure. Cancel every worker
+    // immediately; an already in-flight driver call can still delay exit.
+    *state.failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
+    let mut latest = state.latest.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = state
+        .epoch
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            Some(n.saturating_add(1))
+        });
+    *latest = None;
+    state.wake.notify_all();
+    let _ = tx.try_send(WorkerEvent::Failed(message));
+}
+fn check_worker_failure(worker: &Worker) -> Result<()> {
+    if let Some(message) = *worker
+        .state
+        .failure
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
+        return Err(WorkerFailure(message).into());
+    }
+    Ok(())
+}
 fn worker_loop(
     state: Arc<WorkerState>,
     engine: Arc<dyn MinerEngine>,
     size: u64,
+    worker_index: u32,
     tx: mpsc::Sender<WorkerEvent>,
 ) {
+    let mut previous_generation = 0;
     loop {
         let assigned = {
             let mut lock = state.latest.lock().unwrap_or_else(|e| e.into_inner());
-            while lock.is_none() && state.epoch.load(Ordering::SeqCst) != u64::MAX {
+            while lock
+                .as_ref()
+                .is_none_or(|a| a.generation == previous_generation)
+                && state.epoch.load(Ordering::SeqCst) != u64::MAX
+            {
                 lock = state.wake.wait(lock).unwrap_or_else(|e| e.into_inner());
             }
             if state.epoch.load(Ordering::SeqCst) == u64::MAX {
                 return;
             }
-            lock.take().expect("worker job present")
+            lock.as_ref().expect("worker job present").clone()
         };
+        previous_generation = assigned.generation;
         let cancel = JobIdCancelCheck {
             current_job_id: &state.epoch,
             my_job_id: assigned.generation,
         };
         let mut ctx = engine.prepare_context(assigned.job.header, assigned.job.difficulty);
         ctx.target = assigned.job.target;
-        let (mut start, last) =
-            protocol::nonce_partition(assigned.job.prefix, state.salt, assigned.generation);
+        let (mut start, last) = worker_nonce_partition(
+            assigned.job.prefix,
+            state.salt,
+            assigned.generation,
+            worker_index,
+        );
         while state.epoch.load(Ordering::SeqCst) == assigned.generation {
             let end = start.saturating_add(U512::from(size - 1)).min(last);
             let result = engine.search_range(&ctx, Range { start, end }, &cancel);
@@ -240,11 +377,11 @@ fn worker_loop(
                         || candidate.nonce > end
                         || !assigned.job.verify(&candidate)
                     {
-                        let _ = send_event(
+                        report_worker_failure(
                             &tx,
                             &state,
                             assigned.generation,
-                            WorkerEvent::Failed("engine returned invalid share"),
+                            "engine returned invalid share",
                         );
                         return;
                     }
@@ -262,11 +399,11 @@ fn worker_loop(
                 EngineStatus::Exhausted { .. } => protocol::next_nonce(end, last),
                 EngineStatus::Cancelled { .. } => break,
                 EngineStatus::DeviceLost { .. } | EngineStatus::Running { .. } => {
-                    let _ = send_event(
+                    report_worker_failure(
                         &tx,
                         &state,
                         assigned.generation,
-                        WorkerEvent::Failed("mining engine stopped unexpectedly"),
+                        "mining engine stopped unexpectedly",
                     );
                     return;
                 }
@@ -277,6 +414,21 @@ fn worker_loop(
             }
         }
     }
+}
+/// Fixed worker namespace inside each run/generation namespace. Even when
+/// another device fails or reconnects, no worker is reassigned another range.
+fn worker_nonce_partition(
+    prefix: [u8; 4],
+    salt: [u8; 16],
+    generation: u64,
+    worker: u32,
+) -> (U512, U512) {
+    let (start, _) = protocol::nonce_partition(prefix, salt, generation);
+    let mut low = start.to_big_endian();
+    low[28..32].copy_from_slice(&worker.to_be_bytes());
+    let mut high = low;
+    high[32..].fill(255);
+    (U512::from_big_endian(&low), U512::from_big_endian(&high))
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RequestKind {
@@ -338,14 +490,26 @@ impl Session {
                         !token.is_empty() && token.len() <= 256,
                         "invalid session ID length"
                     );
-                    let job = Job::parse(result.get("job").context("missing login job")?)?;
+                    let initial_job = result.get("job").context("missing login job")?;
+                    let job = if initial_job.is_null() {
+                        None
+                    } else {
+                        Some(Job::parse(initial_job)?)
+                    };
                     self.keepalive = result
                         .get("extensions")
                         .and_then(Value::as_array)
                         .is_some_and(|a| a.iter().any(|s| s.as_str() == Some("keepalive")));
                     self.token = Some(token.into());
-                    self.active = Some(worker.assign(job)?);
-                    log::info!("Stratum authenticated; mining job received");
+                    self.active = job.map(|job| worker.assign(job)).transpose()?;
+                    log::info!(
+                        "Stratum authenticated; {}",
+                        if self.active.is_some() {
+                            "mining job received"
+                        } else {
+                            "waiting for pool job"
+                        }
+                    );
                 }
                 RequestKind::Submit => {
                     if protocol::response_ok(&v) {
@@ -365,35 +529,21 @@ impl Session {
             }
             return Ok(());
         }
-        let method = v
-            .get("method")
-            .and_then(Value::as_str)
-            .context("missing Stratum method/response ID")?;
-        if method == "job" {
-            ensure!(self.token.is_some(), "job before authentication");
-            let params = v.get("params").context("missing job params")?;
-            let job = Job::parse(params.get("job").unwrap_or(params))?;
-            if let Some(old) = &mut self.active {
-                if let (Some(a), Some(b)) = (old.job.sequence, job.sequence) {
-                    ensure!(b >= a, "out-of-order job sequence");
+        match protocol::parse_notification(&v)? {
+            protocol::Notification::Job(job) => {
+                let mut job = *job;
+                ensure!(self.token.is_some(), "job before authentication");
+                if let Some(old) = &mut self.active {
+                    job = old.job.reconcile_update(job)?;
+                    if old.job.same_work(&job) {
+                        old.job.sequence = job.sequence;
+                        return Ok(());
+                    }
                 }
-                if old.job.same_work(&job) {
-                    old.job.sequence = job.sequence.or(old.job.sequence);
-                    return Ok(());
-                }
+                self.active = Some(worker.assign(job)?);
+                log::info!("Stratum job/target updated");
             }
-            self.active = Some(worker.assign(job)?);
-            log::info!("Stratum job updated");
-        } else {
-            let normalized = method.to_ascii_lowercase();
-            ensure!(
-                !normalized.contains("diff")
-                    && !normalized.contains("target")
-                    && !normalized.contains("extranonce")
-                    && !has_work_update(v.get("params")),
-                "unsupported target/difficulty update; reconnecting safely"
-            );
-            log::debug!("Ignoring unrelated Stratum notification");
+            protocol::Notification::Notice => log::debug!("Received bounded compatibility notice"),
         }
         Ok(())
     }
@@ -407,18 +557,6 @@ impl Session {
         self.pending.clear();
         self.token = None;
         self.active = None;
-    }
-}
-fn has_work_update(value: Option<&Value>) -> bool {
-    match value {
-        Some(Value::Object(map)) => map.iter().any(|(key, value)| {
-            matches!(
-                key.as_str(),
-                "difficulty" | "target" | "extranonce" | "mining_hash" | "job"
-            ) || has_work_update(Some(value))
-        }),
-        Some(Value::Array(values)) => values.iter().any(|v| has_work_update(Some(v))),
-        _ => false,
     }
 }
 fn allocate_id(next: &mut u64) -> Result<u64> {
@@ -500,6 +638,7 @@ async fn session_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         let mut last_progress = Instant::now();
         let mut last_hashes = worker.state.hashes.load(Ordering::Relaxed);
         loop {
+            check_worker_failure(worker)?;
             tokio::select! {
                 _ = shutdown_signal(shutdown) => return Ok(()),
                 byte = read.read_u8() => {
@@ -510,7 +649,7 @@ async fn session_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 // replies instead of treating a fast worker as a disconnect.
                 event = shares.recv(), if session.pending.len() < 64 => {
                     match event.context("mining worker disconnected")? {
-                        WorkerEvent::Failed(message) => bail!(message),
+                        WorkerEvent::Failed(message) => return Err(WorkerFailure(message).into()),
                         WorkerEvent::Share(share) => {
                             let (assigned, candidate) = *share;
                             if session.active.as_ref().map(|a| a.generation) != Some(assigned.generation) { stats.stale += 1; continue; }
@@ -526,7 +665,7 @@ async fn session_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                     if last_progress.elapsed() >= Duration::from_secs(10) {
                         let hashes = worker.state.hashes.load(Ordering::Relaxed);
                         let rate = hashes.saturating_sub(last_hashes) as f64 / last_progress.elapsed().as_secs_f64();
-                        log::info!("Stratum progress: {rate:.0} physical H/s; {} hashes, {} accepted, {} rejected", hashes, stats.accepted, stats.rejected);
+                        log::info!("Stratum progress: {rate:.0} physical H/s; {} hashes, {} attempted, {} submitted, {} accepted, {} rejected, {} stale, {} unacknowledged, {} reconnects", hashes, stats.attempted, stats.submitted, stats.accepted, stats.rejected, stats.stale, stats.unacknowledged, stats.reconnects);
                         last_hashes = hashes; last_progress = Instant::now();
                     }
                     ensure!(!session.pending.values().any(|p| p.sent.elapsed() >= config.response_timeout), "Stratum acknowledgement timed out");
@@ -546,18 +685,48 @@ async fn session_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 pub async fn run(
     config: Config,
     engine: Arc<dyn MinerEngine>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<Stats> {
+    run_multi(config, vec![engine], shutdown).await
+}
+
+/// Explicit engine per worker; all workers share one authenticated pool session.
+pub async fn run_multi(
+    config: Config,
+    engines: Vec<Arc<dyn MinerEngine>>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<Stats> {
+    run_multi_observed(config, engines, shutdown, Arc::new(AtomicU64::new(0))).await
+}
+
+/// Shared read-only physical-hash counter for an optional local monitor. The
+/// caller supplies a new zeroed counter; no listener or API server is created.
+pub async fn run_multi_observed(
+    config: Config,
+    engines: Vec<Arc<dyn MinerEngine>>,
     mut shutdown: watch::Receiver<bool>,
+    hashes: Arc<AtomicU64>,
 ) -> Result<Stats> {
     config.validate()?;
-    let (mut worker, mut shares) = Worker::new(engine, config.range_size);
+    ensure!(
+        !engines.is_empty() && engines.len() <= 64,
+        "expected 1..64 explicit mining engines"
+    );
+    let (mut worker, mut shares) =
+        Worker::with_hash_counter(engines, config.range_size, rand::random(), hashes);
     let mut stats = Stats::default();
     let mut next_id = 1;
-    let mut result = loop {
+    let mut endpoint_index = 0;
+    let mut selected = config.clone();
+    let result = loop {
         if *shutdown.borrow() {
-            break Ok(stats);
+            break Ok(());
+        }
+        if let Err(error) = check_worker_failure(&worker) {
+            break Err(error.context("mining worker failure; all devices stopped"));
         }
         match connection(
-            &config,
+            &selected,
             &worker,
             &mut shares,
             &mut shutdown,
@@ -566,29 +735,56 @@ pub async fn run(
         )
         .await
         {
-            Ok(()) => break Ok(stats),
+            Ok(()) => break Ok(()),
             Err(e) => {
                 worker.cancel();
                 log::warn!("Stratum connection stopped: {e}");
+                if e.downcast_ref::<WorkerFailure>().is_some() {
+                    break Err(e.context("mining worker failure; all devices stopped"));
+                }
                 if stats.reconnects >= config.reconnect_attempts {
                     break Err(e.context("Stratum reconnect budget exhausted"));
                 }
                 stats.reconnects += 1;
-                tokio::select! { _ = shutdown_signal(&mut shutdown) => break Ok(stats), _ = tokio::time::sleep(config.reconnect_delay) => {} }
+                endpoint_index = (endpoint_index + 1) % (config.fallback_pools.len() + 1);
+                let endpoint = config.endpoint(endpoint_index);
+                selected.host = endpoint.host;
+                selected.port = endpoint.port;
+                log::info!(
+                    "Retrying explicitly configured TLS endpoint {}:{}",
+                    selected.host,
+                    selected.port
+                );
+                tokio::select! { _ = shutdown_signal(&mut shutdown) => break Ok(()), _ = tokio::time::sleep(config.reconnect_delay) => {} }
             }
         }
     };
     worker.stop();
     if let Some(handle) = worker.handle.take() {
-        tokio::task::spawn_blocking(move || handle.join())
-            .await
-            .context("worker join task failed")?
-            .map_err(|_| anyhow::anyhow!("mining worker panicked"))?;
+        worker.extra_handles.push(handle);
     }
-    if let Ok(stats) = &mut result {
-        stats.hashes = worker.state.hashes.load(Ordering::Relaxed);
+    let handles = std::mem::take(&mut worker.extra_handles);
+    let panicked = tokio::task::spawn_blocking(move || {
+        let mut panicked = false;
+        for handle in handles {
+            panicked |= handle.join().is_err();
+        }
+        panicked
+    })
+    .await
+    .context("worker join task failed")?;
+    ensure!(!panicked, "mining worker panicked");
+    stats.hashes = worker.state.hashes.load(Ordering::Relaxed);
+    if result.is_err() {
+        log::error!("Stratum failed-session summary: {stats:?}");
     }
-    result
+    result.map(|()| stats)
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod operational_tests;
+
+#[cfg(test)]
+mod protocol_update_tests;
