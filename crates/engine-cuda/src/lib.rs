@@ -542,6 +542,13 @@ fn run_single_batch(
             return BatchResult::DeviceLost;
         }
     };
+    // cudarc 0.19.9 submits an asynchronous copy into ordinary host memory.
+    // The pre-copy fence above completes the kernel, not this later copy.
+    // Fence readback explicitly before inspecting the host result buffer.
+    if let Err(e) = buffers.stream.synchronize() {
+        log::error!(target: "cuda_engine", "CUDA result copy completion failed: {e}");
+        return BatchResult::DeviceLost;
+    }
 
     let dispatched = (total_threads as u64 * nonces_per_thread as u64).min(batch_size as u64);
     let hits = result_u32s[0] as usize;
@@ -1007,6 +1014,55 @@ mod tests {
             ),
             EngineStatus::Cancelled { hash_count: 33 }
         ));
+        CudaEngine::clear_worker_resources();
+    }
+
+    #[test]
+    fn cuda_repeated_hit_then_zero_hit_batches_do_not_reuse_stale_results() {
+        let Some(engine) = engine_or_skip_with(MAX_HITS as u32) else {
+            return;
+        };
+        let hit_ctx = JobContext {
+            header: decode32(pow_core::NONCE_HASH_KVS[0].header),
+            difficulty: U512::one(),
+            target: U512::MAX,
+        };
+        let no_hit_ctx = JobContext {
+            header: hit_ctx.header,
+            difficulty: hit_ctx.difficulty,
+            target: U512::zero(),
+        };
+        let mut buffers = create_buffers(engine.engine_id, 0, &engine.devices[0], 1).unwrap();
+        let batch_size = MAX_HITS as u32;
+        for round in 0..16u64 {
+            let start = U512::from(100 + round * u64::from(batch_size));
+            let expected = (0..batch_size)
+                .map(|index| start + U512::from(index))
+                .find(|&nonce| pow_core::hash_from_nonce(&hit_ctx, nonce) < hit_ctx.target)
+                .expect("dense-target fixture must contain a valid nonce");
+            match run_single_batch(&mut buffers, &hit_ctx, start, batch_size) {
+                BatchResult::Found {
+                    candidate,
+                    hash_count,
+                } => {
+                    assert_eq!(candidate.nonce, expected, "hit batch {round}");
+                    assert_eq!(candidate.work, expected.to_big_endian());
+                    assert_eq!(
+                        candidate.hash,
+                        pow_core::hash_from_nonce(&hit_ctx, expected)
+                    );
+                    assert_eq!(hash_count, u64::from(batch_size));
+                }
+                _ => panic!("hit batch {round} did not return a verified candidate"),
+            }
+            assert!(
+                matches!(
+                    run_single_batch(&mut buffers, &no_hit_ctx, start, batch_size),
+                    BatchResult::NotFound { hash_count } if hash_count == u64::from(batch_size)
+                ),
+                "zero-hit batch {round} reused stale results or failed"
+            );
+        }
         CudaEngine::clear_worker_resources();
     }
 
