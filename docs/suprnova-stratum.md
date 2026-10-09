@@ -117,6 +117,59 @@ The duration defaults to 120 seconds and is capped at 24 hours per invocation.
 Ctrl+C also requests shutdown. A GPU/driver call that is already blocked can
 delay shutdown; this implementation does not claim to recover a hung driver.
 
+## Bounded batch-size measurement on Windows
+
+After rebuilding the keepalive fix, use PowerShell 7 (`pwsh`) to run the
+measurement helper. This sends real shares and requires your public payout
+address explicitly. The worker defaults to `yuunyan`:
+
+```powershell
+pwsh -File .\scripts\measure_stratum_batches.ps1 -SelfTest
+cargo build -p miner-cli --release --locked
+pwsh -File .\scripts\measure_stratum_batches.ps1 -Wallet YOUR_PUBLIC_QZ_ADDRESS
+```
+
+To select a results destination or executable explicitly:
+
+```powershell
+pwsh -File .\scripts\measure_stratum_batches.ps1 -Wallet YOUR_PUBLIC_QZ_ADDRESS -OutputDirectory "$HOME\Documents\QuantusMeasurements" -ExecutablePath .\target\release\quantus-miner.exe
+```
+
+The helper runs 1M, 4M, 8M, 16M, then 1M again, serially for 120 seconds each.
+The repeated baseline helps reveal thermal or other time-dependent drift;
+there is no kernel, clock, voltage, power-limit, driver, or security change.
+Each miner has a hard 180-second process deadline by default (120 seconds plus
+60 seconds of initialization/exit allowance). Ctrl+C requests best-effort child-tree
+termination. A hung driver can prevent termination; if cleanup warns, check
+Task Manager before starting another miner.
+A process/summary failure, reconnect, rejected/invalid share, or unacknowledged
+share aborts the remaining sweep. Zero accepted shares can simply reflect luck
+and does not by itself abort a valid run. Stale counts are recorded separately.
+The measurement command disables reconnect retries to expose a broken
+baseline quickly. No further trials start if the first trial fails.
+
+Timestamped outputs default to the system temporary directory, outside the
+repository. `results.json`, `results.csv`, separate stdout/stderr logs,
+executable SHA256, repository revision/dirty status, and read-only GPU snapshots
+are retained after failures. If an output reader itself fails to finish after
+termination, a diagnostic replaces that run's raw output; earlier logs remain. No wallet is embedded in the script or metadata.
+`nvidia-smi` metadata is optional and has its own ten-second deadline. Nothing
+is committed automatically. Do not update the executable or driver mid-sweep.
+
+Effective physical MH/s is the final engine hash count divided by actual child
+process wall time, including setup, pool connection, and exit. It is distinct
+from a kernel-only benchmark, accepted-work rate, or the pool's estimate.
+Use raw logs and before/after GPU temperature/power snapshots when interpreting
+a larger batch's result. A difference is a measurement, not an optimization
+claim until it repeats under comparable conditions.
+
+Validated with official PowerShell 7.6.6 on Linux: offline summary parsing,
+five-run mock success, early abort with partial results on failure, process
+deadline/tree cleanup, and concurrent stdout/stderr draining. These mocks do
+not execute the miner, connect to a pool, or establish Windows/GPU behavior.
+The offline `-SelfTest` checks summary-parser fixtures without starting a
+process or connecting to a pool; run it before the real sweep.
+
 ## Correctness and operational limits
 
 - Reject malformed, oversized or inconsistent job data before hashing
