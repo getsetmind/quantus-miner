@@ -762,6 +762,37 @@ mod tests {
     }
 
     #[test]
+    fn dense_four_million_batch_counts_all_physical_overflow_replays() {
+        let start = U512::from(0xfeed_face_0000_0000u64);
+        let mut cursor = BatchCursor::new(
+            Range {
+                start,
+                end: start + U512::from(3_999_999u32),
+            },
+            4_000_000,
+        );
+        let expected_launches = [
+            4_000_000, 2_000_000, 1_000_000, 500_000, 250_000, 125_000, 62_500, 31_250, 15_625,
+            7_812, 3_906, 1_953, 976, 488, 244, 122, 61, 30, 15, 7,
+        ];
+        assert_eq!(MAX_HITS, 8);
+        let mut physical_hashes = 0u64;
+        for expected in expected_launches {
+            let batch_size = cursor.batch_size();
+            assert_eq!(batch_size, expected);
+            assert_eq!(cursor.start, start, "overflow must not advance the nonce");
+            physical_hashes += u64::from(batch_size);
+            if batch_size > MAX_HITS as u32 {
+                cursor.replay_overflow(batch_size);
+            }
+        }
+        // Every nonce is a candidate: 19 overflowing launches followed by
+        // one fitting launch of 7 nonces. All physical work is counted.
+        assert_eq!(cursor.batch_size(), 7);
+        assert_eq!(physical_hashes, 7_999_989);
+    }
+
+    #[test]
     fn batch_cursor_reduction_terminates_and_respects_range_and_carry() {
         let mut cursor = BatchCursor::new(
             Range {
@@ -1216,13 +1247,15 @@ mod tests {
         let Some(engine) = engine_or_skip_with(batch_size) else {
             return;
         };
-        // Difficulty 1 makes every nonce a candidate. No thread stops early, so
-        // the launch evaluates the whole batch; only MAX_HITS candidates are
-        // recorded and the returned one must be a CPU-verified member of the range.
+        // Difficulty 1 makes every nonce a candidate. Each launch evaluates
+        // its whole batch; overflowing launches replay the same start at half
+        // size until 7 candidates fit. Count all 20 launches (7,999,989 hashes)
+        // and return the lowest CPU-valid nonce, rather than an arbitrary claim.
         let header = decode32(pow_core::NONCE_HASH_KVS[1].header);
         let ctx = engine.prepare_context(header, U512::one());
         let start = U512::from(0xfeed_face_0000_0000u64);
         let end = start + U512::from(batch_size - 1);
+        assert!(pow_core::hash_from_nonce(&ctx, start) < ctx.target);
         let cancel = AtomicBool::new(false);
         match engine.search_range(&ctx, Range { start, end }, &AtomicBoolCancelCheck(&cancel)) {
             EngineStatus::Found {
@@ -1230,13 +1263,13 @@ mod tests {
                 hash_count,
                 ..
             } => {
-                assert!(candidate.nonce >= start && candidate.nonce <= end);
+                assert_eq!(candidate.nonce, start);
                 assert_eq!(
                     pow_core::hash_from_nonce(&ctx, candidate.nonce),
                     candidate.hash
                 );
                 assert!(candidate.hash < ctx.target);
-                assert_eq!(hash_count, batch_size as u64);
+                assert_eq!(hash_count, 7_999_989);
             }
             other => panic!("expected Found, got {other:?}"),
         }
