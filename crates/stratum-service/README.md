@@ -30,19 +30,23 @@ floor(MAX_U512 / integer difficulty). Unknown algorithm, malformed fields,
 out-of-order job sequence, partial target/difficulty changes, frame overflow,
 invalid request state and acknowledgement timeout end the session and cancel
 mining. Unrelated notifications are ignored. Sequence-only job updates retain
-the same nonce cursor. Keepalive is sent only when the login advertises it.
+the same nonce cursor. Keepalive is sent only when the login advertises it. Its response accepts
+object status `KEEPALIVED` (or legacy `OK`) only when there is no non-null error;
+`KEEPALIVED` never counts as an accepted share.
 The 64-request acknowledgement window applies backpressure to both new shares
 and keepalive requests; incoming acknowledgements can still drain the window.
 Credentials, session IDs, wire JSON, and pool rejection messages are not logged.
 
-## Unverified compatibility
+## Live compatibility and remaining limits
 
-The `submit` shape is provisional: params contain session `id`, `job_id`,
+The `submit` shape is: params contain session `id`, `job_id`,
 a 128-character big-endian `nonce`, and a 128-character big-endian `result`.
-This matches the inspected public Quantus reference interfaces, but no real
-share was submitted or accepted during implementation. No source code from
-those references was copied. This implementation does not establish CUDA
-hardware performance or remove the CUDA engine's documented approximate-field
+This matches the inspected public Quantus reference interfaces, and a later user-run 120-second Windows RTX 3060 session received three
+accepted-share acknowledgements and showed one worker in the pool. That run
+also reconnected three times after keepalive rejection; stable keepalive behavior
+requires a retry after the reference-supported `KEEPALIVED` parser fix. No source code from
+those references was copied. The observed local benchmark does not establish sustained thermal/power
+performance or remove the CUDA engine's documented approximate-field
 arithmetic miss risk. No payout address appears in fixtures.
 
 ## Offline checks

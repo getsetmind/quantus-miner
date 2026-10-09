@@ -1,5 +1,5 @@
-//! Quantus JSON-line protocol. Submit shape is provisional until a real share
-//! has been accepted by Suprnova. No upstream implementation was copied.
+//! Quantus JSON-line protocol. A bounded user-run Suprnova trial received
+//! accepted-share acknowledgements. No upstream implementation was copied.
 use anyhow::{bail, ensure, Context, Result};
 use engine_cpu::Candidate;
 use pow_core::JobContext;
@@ -121,6 +121,19 @@ pub fn response_ok(value: &Value) -> bool {
     value.get("error").is_none_or(Value::is_null)
         && (value.get("result") == Some(&Value::Bool(true))
             || value.pointer("/result/status").and_then(Value::as_str) == Some("OK"))
+}
+
+/// Keepalive replies have their own success status, which must never count as
+/// share acceptance. The pinned NOMP Quantus wire reference documents
+/// `KEEPALIVED`; retain object-status `OK` compatibility, while rejecting
+/// missing/malformed results, boolean results, and every non-null error.
+/// Reference: https://pkg.go.dev/github.com/mining-pool/not-only-mining-pool@v0.0.0-20260912023102-dbfed907ce52/engine/quantus
+pub fn keepalive_response_ok(value: &Value) -> bool {
+    value.get("error").is_none_or(Value::is_null)
+        && matches!(
+            value.pointer("/result/status").and_then(Value::as_str),
+            Some("KEEPALIVED" | "OK")
+        )
 }
 
 /// Increment without wrapping through a pool-controlled prefix.

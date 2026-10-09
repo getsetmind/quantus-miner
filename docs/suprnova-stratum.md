@@ -11,10 +11,11 @@ A user-run, non-mining TLS probe received a successful login and an initial
 32-byte mining hash, a 4-byte extranonce, a 64-byte big-endian target and an
 integer difficulty. The captured target equals `U512::MAX / difficulty`.
 
-This is **not** evidence that this implementation has submitted an accepted
-share. The submit format and ongoing notification handling remain provisional
-until a bounded live test confirms both the server acknowledgement and the
-pool's worker accounting. Offline tests cannot establish that compatibility.
+A subsequent user-run 120-second Windows RTX 3060 trial received three
+accepted-share acknowledgements, with no rejected, unacknowledged or stale
+shares, and a screenshot showed one worker reflected in the pool. It stopped
+cleanly at the requested duration. The run also had three keepalive-triggered
+reconnections, so stable ongoing-session behavior is not yet established.
 
 ### Validation snapshot (2026-10-09)
 
@@ -29,8 +30,30 @@ On the cloud Linux host, Rust 1.93.0:
 - The mock integration test passed 50 consecutive runs after acknowledgement
   window backpressure was added
 - CUDA-dependent tests skip on this host because no NVIDIA CUDA device is
-  available. GPU validation, Windows compilation, and real pool acceptance
-  remain outstanding
+  available. Cloud GPU execution remains unavailable; the later user-run Windows
+  results below provide the hardware and pool observations
+
+### User-run Windows RTX 3060 results (2026-10-09)
+
+- All 17 engine-cuda tests passed on the GPU-equipped host in 10.02 seconds
+- Local benchmark: 142.84 MH/s
+- Bounded 120-second Suprnova session: 12.52 billion physical hashes,
+  3 accepted, 0 rejected, 0 unacknowledged, 0 stale, and 3 reconnects
+- Clean timed stop; pool screenshot reflected one worker
+- The pool's 535.71 MH/s estimate is a short-window accounting estimate,
+  separate from the measured local benchmark
+
+Each reconnect followed a keepalive rejection around the 30-second interval.
+The actual reply payload was not captured. The pinned [NOMP Quantus wire
+reference](https://pkg.go.dev/github.com/mining-pool/not-only-mining-pool@v0.0.0-20260912023102-dbfed907ce52/engine/quantus)
+documents `KEEPALIVED` for keepalive success, while this client previously
+required the share/login success status `OK`. The dedicated keepalive parser
+now accepts object status `KEEPALIVED` or `OK` only with an absent/null error;
+share success parsing remains unchanged and does not accept `KEEPALIVED`.
+This is a reference-supported compatibility fix, not proof of the uncaptured
+live response. A bounded retry is needed to verify that the reconnects stop.
+The keepalive patch passes all 19 focused offline Stratum tests and focused
+Clippy with warnings denied; malformed/error responses remain rejected.
 
 ## Build and offline validation
 
@@ -65,8 +88,7 @@ A Windows RTX 3060 run rejected the upstream `=&r` asm constraints. The fix
 uses block-local PTX registers and only publishes output operands after all
 inputs have been consumed, rather than simply removing early-clobber markers.
 On Linux both the original and corrected source compiled with NVRTC 12.4.127
-and 13.4.92; the reported failure was not reproduced on Linux. Windows retry
-and GPU correctness tests are still required. The runtime now logs NVRTC's
+and 13.4.92; the reported failure was not reproduced on Linux. The subsequent Windows retry and engine-cuda tests passed. The runtime now logs NVRTC's
 major/minor version to help distinguish actual compiler configurations.
 
 ## Bounded Windows GPU trial

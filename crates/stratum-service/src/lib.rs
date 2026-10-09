@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
-//! Experimental verified-TLS Quantus Stratum client. Real accepted-share
-//! compatibility is unverified. Single correctness-first CPU/CUDA worker.
+//! Experimental verified-TLS Quantus Stratum client. A bounded live trial
+//! received accepted shares; ongoing stability still needs validation.
+//! Single correctness-first CPU/CUDA worker.
 pub mod protocol;
 use anyhow::{bail, ensure, Context, Result};
 use engine_cpu::{Candidate, EngineStatus, JobIdCancelCheck, MinerEngine, Range};
@@ -356,7 +357,10 @@ impl Session {
                     }
                 }
                 RequestKind::Keepalive => {
-                    ensure!(protocol::response_ok(&v), "Stratum keepalive rejected")
+                    ensure!(
+                        protocol::keepalive_response_ok(&v),
+                        "Stratum keepalive rejected"
+                    )
                 }
             }
             return Ok(());

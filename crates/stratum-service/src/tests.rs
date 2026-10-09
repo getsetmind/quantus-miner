@@ -480,3 +480,86 @@ async fn offline_mock_pool_verifies_login_multiple_shares_and_acks_end_to_end() 
         .unwrap()
         .unwrap();
 }
+
+#[test]
+fn keepalive_success_is_request_specific_and_requires_valid_status_without_error() {
+    for status in ["KEEPALIVED", "OK"] {
+        for error in [None, Some(Value::Null)] {
+            let mut reply = json!({"id":7,"result":{"status":status}});
+            if let Some(error) = error {
+                reply["error"] = error;
+            }
+            assert!(protocol::keepalive_response_ok(&reply));
+        }
+    }
+    let invalid = [
+        json!({"result":{"status":"KEEPALIVED"},"error":{"code":-1,"message":"synthetic rejection"}}),
+        json!({"result":{"status":"KEEPALIVED"},"error":false}),
+        json!({"result":{"status":"KEEPALIVED"},"error":{}}),
+        json!({"result":{"status":"keepalived"},"error":null}),
+        json!({"result":{"status":"REJECTED"},"error":null}),
+        json!({"result":{"status":true},"error":null}),
+        json!({"result":true,"error":null}),
+        json!({"result":false,"error":null}),
+        json!({"result":"KEEPALIVED","error":null}),
+        json!({"result":null,"error":null}),
+        json!({"error":null}),
+    ];
+    for reply in invalid {
+        assert!(
+            !protocol::keepalive_response_ok(&reply),
+            "must reject {reply}"
+        );
+    }
+    assert!(!protocol::response_ok(
+        &json!({"result":{"status":"KEEPALIVED"},"error":null})
+    ));
+    assert!(protocol::response_ok(
+        &json!({"result":{"status":"OK"},"error":null})
+    ));
+}
+
+#[test]
+fn keepalive_ack_preserves_session_and_never_increments_share_acceptance() {
+    let worker = fake_worker();
+    let mut s = Session::new();
+    let mut stats = Stats::default();
+    s.token = Some("synthetic-session".into());
+    s.active = Some(worker.assign(easy_job()).unwrap());
+    let generation = s.active.as_ref().unwrap().generation;
+    s.register(10, RequestKind::Keepalive).unwrap();
+    s.handle(
+        json!({"id":10,"jsonrpc":"2.0","result":{"status":"KEEPALIVED"},"error":null}),
+        &worker,
+        &mut stats,
+    )
+    .unwrap();
+    assert!(s.pending.is_empty());
+    assert_eq!(s.active.as_ref().unwrap().generation, generation);
+    assert_eq!(stats.accepted, 0);
+    assert_eq!(stats.rejected, 0);
+    s.register(11, RequestKind::Submit).unwrap();
+    s.handle(
+        json!({"id":11,"result":{"status":"KEEPALIVED"},"error":null}),
+        &worker,
+        &mut stats,
+    )
+    .unwrap();
+    assert_eq!(stats.accepted, 0);
+    assert_eq!(stats.rejected, 1);
+    s.register(12, RequestKind::Keepalive).unwrap();
+    assert!(s
+        .handle(
+            json!({"id":12,"result":{"status":"KEEPALIVED"},"error":{"code":-1}}),
+            &worker,
+            &mut stats
+        )
+        .is_err());
+    assert!(s
+        .handle(
+            json!({"id":999,"result":{"status":"KEEPALIVED"},"error":null}),
+            &worker,
+            &mut stats
+        )
+        .is_err());
+}

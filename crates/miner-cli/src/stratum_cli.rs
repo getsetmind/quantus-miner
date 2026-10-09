@@ -125,7 +125,7 @@ pub(crate) async fn run(args: StratumArgs) -> Result<()> {
         }
         let _ = shutdown_tx.send(true);
     });
-    log::info!("Starting experimental TLS Stratum session; stop requested after {duration}s (in-flight GPU work may delay exit); share acceptance is not yet live-validated");
+    log::info!("Starting experimental TLS Stratum session; stop requested after {duration}s (in-flight GPU work may delay exit)");
     let result = stratum_service::run(config, engine, shutdown_rx).await;
     timer.abort();
     match result {
