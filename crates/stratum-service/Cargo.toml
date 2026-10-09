@@ -1,0 +1,19 @@
+[package]
+name = "stratum-service"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Correctness-first TLS Quantus Stratum client"
+
+[dependencies]
+anyhow = { workspace = true }
+engine-cpu = { path = "../engine-cpu" }
+hex = { workspace = true }
+log = { workspace = true }
+pow-core = { path = "../pow-core" }
+primitive-types = { workspace = true }
+rand = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"

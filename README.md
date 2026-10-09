@@ -1,5 +1,10 @@
 # External Miner Service for Quantus Network
 
+This fork also contains an **experimental single-worker TLS Stratum client**
+for Suprnova. See [setup, test status and safety limits](docs/suprnova-stratum.md).
+The native QUIC `serve` command is unchanged; use the separate `stratum`
+command only for an explicitly requested pool-mining session.
+
 High-performance external mining service for Quantus Network with support for CPU, GPU, and hybrid CPU+GPU mining.
 
 ## Building

@@ -11,6 +11,7 @@ members = [
 	"crates/pow-core",
 	"crates/quic-transport",
 	"crates/solver-wasm",
+	"crates/stratum-service",
 ]
 default-members = ["crates/miner-cli"]
 resolver = "2"

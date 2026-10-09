@@ -6,6 +6,8 @@ publish = false
 description = "CLI binary to run the Quantus External Miner service"
 
 [dependencies]
+anyhow = { workspace = true }
+stratum-service = { path = "../stratum-service" }
 miner-service = { path = "../miner-service" }
 metrics = { path = "../metrics", features = ["http-exporter"] }
 quic-transport = { path = "../quic-transport" }

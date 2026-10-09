@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod stratum_cli;
+
 // CLI defaults
 const DEFAULT_GPU_BATCH_SIZE: u32 = 1_000_000;
 const DEFAULT_CUDA_BATCH_SIZE: u32 = 32_000_000;
@@ -16,6 +18,8 @@ const DEFAULT_CPU_BATCH_SIZE: u64 = 10_000;
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Run a bounded single-worker TLS Stratum pool session (experimental)
+    Stratum(stratum_cli::StratumArgs),
     /// Run the mining service
     Serve {
         /// Address of the node to connect to
@@ -158,6 +162,18 @@ async fn main() {
     };
 
     match command {
+        Command::Stratum(args) => {
+            if !args.verbose && std::env::var("RUST_LOG").is_err() {
+                // CUDA logs each search range at info; pool ranges are short.
+                // Keep pool progress readable without changing other commands.
+                std::env::set_var("RUST_LOG", "info,cuda_engine=warn");
+            }
+            init_logger(args.verbose);
+            if let Err(error) = stratum_cli::run(args).await {
+                log::error!("Stratum session stopped: {error:#}");
+                std::process::exit(1);
+            }
+        }
         Command::Serve {
             node_addr,
             auth_token,
