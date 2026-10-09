@@ -7,11 +7,13 @@ baseline binary were not changed. No GPU execution was available.
 ## Measurement context
 
 The user's RTX 3060 sustained 134.667 MH/s with 4M batches during a 120-second
-actual-mining run on driver 617.42, with background apps closed and no reported
-reconnects or errors. A separate 32M-batch, 10-second benchmark reached 146.52
-MH/s. These different batch sizes and workloads do not establish a speedup or
-prove the sustained 140 MH/s goal. Earlier batch sweeps were contaminated by
-background apps and are unsuitable for optimization conclusions.
+actual-mining run on driver 617.42, with no reported reconnects or errors.
+The user explicitly closed background apps for the separate 32M-batch,
+10-second benchmark that reached 146.52 MH/s; continued absence of competing
+GPU load during the later pool run was not independently verified. These
+different batch sizes and workloads do not establish a speedup or prove the
+sustained 140 MH/s goal. Earlier batch sweeps did not control background GPU
+load, so their rankings remain provisional.
 
 For a full 4,000,000-nonce batch, 134.667 MH/s corresponds to approximately
 29.70 ms, while 140 MH/s corresponds to 28.57 ms. Closing the entire gap through
